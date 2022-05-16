@@ -50,3 +50,10 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# Visual Studio build files
+**/Release
+**/Debug
+
+# Visual Studio hidden files (auto pre-compiled headers)
+**/.vs
