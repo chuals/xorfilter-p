@@ -27,6 +27,7 @@ typedef struct fuse8_s {
 } fuse8_t;
 
 struct fuse_fuseset_s {
+    // Note: 64-bit width not supported on Amazon EC2 GPU instance
     // uint64_t fusemask;
     uint32_t fusemask1;
     uint32_t fusemask2;
@@ -48,17 +49,19 @@ struct fuse_hashes_s {
     uint32_t h0;
     uint32_t h1;
     uint32_t h2;
+    uint32_t h3;
 };
 
 typedef struct fuse_hashes_s fuse_hashes_t;
 
-struct fuse_h0h1h2_s {
+struct fuse_h0h1h2h3_s {
     uint32_t h0;
     uint32_t h1;
     uint32_t h2;
+    uint32_t h3;
 };
 
-typedef struct fuse_h0h1h2_s fuse_h0h1h2_t;
+typedef struct fuse_h0h1h2h3_s fuse_h0h1h2_t;
 
 static inline uint64_t fuse_murmur64(uint64_t h) {
     h ^= h >> 33;
@@ -131,7 +134,7 @@ static inline uint64_t d_fuse_mix_split(uint64_t key, uint64_t seed) {
 }
 
 __device__
-static inline fuse_hashes_t d_fuse8_get_h0_h1_h2(uint64_t k, const fuse8_t* filter) {
+static inline fuse_hashes_t d_fuse8_get_h0_h1_h2_h3(uint64_t k, const fuse8_t* filter) {
     uint64_t hash = d_fuse_mix_split(k, filter->seed);
     fuse_hashes_t answer;
     answer.h = hash;
