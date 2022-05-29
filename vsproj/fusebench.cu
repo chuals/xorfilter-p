@@ -8,6 +8,12 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
+#include <thrust/sort.h>
+#include <thrust/reduce.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/count.h>
+#include <thrust/execution_policy.h>
+
 #define FUSE_ARITY 3
 #define FUSE_SEGMENT_COUNT 100
 #define FUSE_SLOTS (FUSE_SEGMENT_COUNT + FUSE_ARITY - 1)
@@ -32,6 +38,7 @@ struct fuse_fuseset_s {
     uint32_t fusemask2;
     uint32_t count;
     uint32_t layer;
+    uint32_t origIdx; // store original index before sorting
 };
 
 typedef struct fuse_fuseset_s fuse_fuseset_t;
@@ -59,6 +66,13 @@ struct fuse_h0h1h2_s {
 };
 
 typedef struct fuse_h0h1h2_s fuse_h0h1h2_t;
+
+struct is_recovered {
+    __host__ __device__
+    bool operator()(fuse_fuseset_t &x) {
+        return x.layer > 0;
+    }
+};
 
 static inline uint64_t fuse_murmur64(uint64_t h) {
     h ^= h >> 33;
@@ -195,6 +209,8 @@ void peel_set0(fuse_fuseset_t* sets, fuse_fuseset_t* sets0, fuse_fuseset_t* sets
             uint64_t hash = ((uint64_t)sets0[i].fusemask1) << 32 | sets0[i].fusemask2;
             sets0[i].layer = *layer;
             sets[sets_idx].layer = *layer;
+            // store the original index, in case the array is sorted
+            sets[sets_idx].origIdx = sets_idx;
             *pureCell = true; // race condition but should be safe
             fuse_h0h1h2_t hs = d_fuse8_get_just_h0_h1_h2(hash, filter);
 
@@ -281,6 +297,8 @@ void peel_set1(fuse_fuseset_t* sets, fuse_fuseset_t* sets0, fuse_fuseset_t* sets
             uint64_t hash = ((uint64_t)sets1[i].fusemask1) << 32 | sets1[i].fusemask2;
             sets1[i].layer = *layer;
             sets[sets_idx].layer = *layer;
+            // store the original index, in case the array is sorted
+            sets[sets_idx].origIdx = sets_idx;
             *pureCell = true; // race condition but should be safe
             fuse_h0h1h2_t hs = d_fuse8_get_just_h0_h1_h2(hash, filter);
 
@@ -367,6 +385,8 @@ void peel_set2(fuse_fuseset_t* sets, fuse_fuseset_t* sets0, fuse_fuseset_t* sets
             uint64_t hash = ((uint64_t)sets2[i].fusemask1) << 32 | sets2[i].fusemask2;
             sets2[i].layer = *layer;
             sets[sets_idx].layer = *layer;
+            // store the original index, in case the array is sorted
+            sets[sets_idx].origIdx = sets_idx;
             *pureCell = true; // race condition but should be safe
             fuse_h0h1h2_t hs = d_fuse8_get_just_h0_h1_h2(hash, filter);
 
@@ -440,13 +460,87 @@ void peel_set2(fuse_fuseset_t* sets, fuse_fuseset_t* sets0, fuse_fuseset_t* sets
     }
 }
 
+static inline int compare_layers(const void* p, const void* q) {
+    uint32_t x = (*(const fuse_fuseset_t*)p).layer;
+    uint32_t y = (*(const fuse_fuseset_t*)q).layer;
+
+    // Avoid return x - y, which can cause undefined behaviour
+    //   because of signed integer overflow.
+    if (x < y)
+        return 1;
+    else if (x > y)
+        return -1;
+    return 0;
+}
+
+static inline uint32_t* sortcount_layers(fuse_fuseset_t* sets, size_t n, size_t max_layer) {
+    uint32_t* keys;
+    cudaError_t err_keys = cudaMallocManaged(&keys, n * sizeof(uint32_t));
+
+    if (err_keys != cudaSuccess) {
+        fprintf(stderr, "Failed to allocate unified vector (error code %s)!\n", cudaGetErrorString(err_keys));
+        return NULL;
+    }
+
+    for (size_t i = 0; i < n; i++)
+        keys[i] = sets[i].layer;
+
+    thrust::sort_by_key(thrust::device, keys, keys + n, sets, thrust::greater<uint32_t>());
+    cudaDeviceSynchronize();
+    thrust::pair<uint32_t*, uint32_t*> new_end;
+        
+    uint32_t* hist_keys;                         
+    uint32_t* hist_freqs;                         
+    cudaError_t err_hist_keys = cudaMallocManaged(&hist_keys, max_layer * sizeof(uint32_t));
+    cudaError_t err_hist_freqs = cudaMallocManaged(&hist_freqs, max_layer * sizeof(uint32_t));
+
+    if (err_hist_keys != cudaSuccess) {
+        fprintf(stderr, "Failed to allocate unified vector (error code %s)!\n", cudaGetErrorString(err_hist_keys));
+        return NULL;
+    }
+
+    if (err_hist_freqs != cudaSuccess) {
+        fprintf(stderr, "Failed to allocate unified vector (error code %s)!\n", cudaGetErrorString(err_hist_freqs));
+        return NULL;
+    }
+
+    new_end = thrust::reduce_by_key(thrust::device, keys, keys + n, thrust::make_constant_iterator(1), hist_keys, hist_freqs);
+    cudaDeviceSynchronize();
+
+    cudaFree(keys);
+    cudaFree(hist_keys);
+
+    return hist_freqs;
+}
+
+// TODO Remove temporary method to generate a histogram of layer keys
+static inline uint32_t * count_by_key(fuse_fuseset_t* sets, size_t n, size_t max_value) {
+    uint32_t* counts;
+    // To prevent array OOB, we initialize counting array with size = max_key_value + 1
+    cudaError_t err_counts = cudaMallocManaged(&counts, (max_value+1) * sizeof(uint32_t));
+    
+    if (err_counts != cudaSuccess) {
+        fprintf(stderr, "Failed to allocate unified vector (error code %s)!\n", cudaGetErrorString(err_counts));
+        return NULL;
+    }
+
+    // Ensure counting array is zero-ed
+    memset(counts, 0, (max_value+1) * sizeof(uint32_t));
+
+    for (size_t i = 0; i < n; i++) {
+        counts[sets[i].layer]++;
+    }
+
+    return counts;
+}
+
 __global__
 void assign(fuse8_t* filter, fuse_fuseset_t* sets, size_t layer, size_t arrayLength) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
     for (int i = index; i < arrayLength; i += stride) {
         if (sets[i].layer == layer) {
-            uint64_t key_hash = ((uint64_t)sets[i].fusemask1) << 32 | sets[i].fusemask2;
+            uint64_t key_hash = ((uint64_t)sets[i].fusemask1) << 32 | sets[i].fusemask2; // 32-bit limitation on nVidia GPU
             fuse_h0h1h2_t hs = d_fuse8_get_just_h0_h1_h2(key_hash, filter);
             uint8_t hsh = d_fuse_fingerprint(key_hash);
 
@@ -464,6 +558,36 @@ void assign(fuse8_t* filter, fuse_fuseset_t* sets, size_t layer, size_t arrayLen
     }
 }
 
+__global__
+void assign_compacted(fuse8_t* filter, fuse_fuseset_t* sets, size_t layer, size_t compactLen) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = index; i < compactLen; i += stride) {
+        uint64_t key_hash = ((uint64_t)sets[i].fusemask1) << 32 | sets[i].fusemask2; // 32-bit limitation on nVidia GPU
+        fuse_h0h1h2_t hs = d_fuse8_get_just_h0_h1_h2(key_hash, filter);
+        uint8_t hsh = d_fuse_fingerprint(key_hash);
+
+        // TODO revert debugging code
+        /* uint32_t h0 = hs.h0;
+        uint32_t h1 = hs.h1;
+        uint32_t h2 = hs.h2;
+        uint32_t orig = sets[i].origIdx;*/ 
+
+        if (sets[i].origIdx == hs.h0) {
+            hsh ^= filter->fingerprints[hs.h1] ^ filter->fingerprints[hs.h2];
+        }
+        else if (sets[i].origIdx == hs.h1) {
+            hsh ^= filter->fingerprints[hs.h0] ^ filter->fingerprints[hs.h2];
+        }
+        else {
+            hsh ^= filter->fingerprints[hs.h0] ^ filter->fingerprints[hs.h1];
+        }
+        filter->fingerprints[sets[i].origIdx] = hsh;
+    }
+}
+
+
+
 // allocate enough capacity for a set containing up to 'size' elements
 // caller is responsible to call fuse8_free(filter)
 static inline bool fuse8_allocate(uint32_t size, fuse8_t* filter) {
@@ -479,7 +603,19 @@ static inline bool fuse8_allocate(uint32_t size, fuse8_t* filter) {
     }
 }
 
+// TODO Remove temporary method to count number of pure cells per parallel peeling subround
+void count_pure_cells(fuse8_t* filter, const fuse_fuseset_t* arr, size_t setId) {
+    uint32_t cnt = 0;
+    for (uint64_t i = 0; i < filter->segmentLength * (FUSE_SLOTS / FUSE_ARITY); i++) {
+        if (arr[i].count == 1) {
+            cnt += 1;
+        }
+    }
+    printf("Found %lu pure cells in set%zu\n", cnt, setId);
+}
+
 bool fuse8_populate(const uint64_t* keys, uint32_t size, fuse8_t* filter) {
+    clock_t setup_t = clock();
     uint64_t rng_counter = 1;
     filter->seed = fuse_rng_splitmix64(&rng_counter);
     size_t arrayLength = filter->segmentLength * FUSE_SLOTS; // size of the backing array
@@ -487,8 +623,7 @@ bool fuse8_populate(const uint64_t* keys, uint32_t size, fuse8_t* filter) {
     cudaError_t errSets = cudaMallocManaged(&sets, arrayLength * sizeof(fuse_fuseset_t));
 
     if (errSets != cudaSuccess) {
-        fprintf(stderr, "Failed to allocate device vector A (error code %s)!\n",
-            cudaGetErrorString(errSets));
+        fprintf(stderr, "Failed to allocate device vector (error code %s)!\n", cudaGetErrorString(errSets));
         return false;
     }
 
@@ -496,7 +631,7 @@ bool fuse8_populate(const uint64_t* keys, uint32_t size, fuse8_t* filter) {
     cudaMallocManaged(&layer, sizeof(size_t));
     *layer = 0;
 
-    // parallelism config
+    // Default kernel config
     int blockSize = 128;
     int numBlocks = (filter->segmentLength + blockSize - 1) / blockSize;
 
@@ -507,26 +642,27 @@ bool fuse8_populate(const uint64_t* keys, uint32_t size, fuse8_t* filter) {
             return false;
         }
 
-
         memset(sets, 0, sizeof(fuse_fuseset_t) * arrayLength);
+        setup_t = clock() - setup_t;
+        double time_taken = ((double)setup_t) / CLOCKS_PER_SEC; // in seconds
+        printf("It took %f seconds to setup backing array.\n", time_taken);
 
-        clock_t t = clock();
+        clock_t insert_t = clock();
         insert_keys << <numBlocks, blockSize >> > (keys, size, sets, filter);
         cudaDeviceSynchronize();
-        t = clock() - t;
-        double time_taken = ((double)t) / CLOCKS_PER_SEC; // in seconds
-        printf("It took %f seconds to insert %zu values. \n",
-            time_taken, size);
+        insert_t = clock() - insert_t;
+        time_taken = ((double)insert_t) / CLOCKS_PER_SEC; // in seconds
+        printf("It took %f seconds to insert %u values. \n", time_taken, size);
 
         fuse_fuseset_t* sets0, * sets1, * sets2;
 
-        t = clock();
+        clock_t copy_t = clock();
         // copy out sets into 3 smaller arrays
-        cudaError_t errSets0 = cudaMallocManaged(&sets0, filter->segmentLength * (FUSE_SLOTS / 3) * sizeof(fuse_fuseset_t));
-        cudaError_t errSets1 = cudaMallocManaged(&sets1, filter->segmentLength * (FUSE_SLOTS / 3) * sizeof(fuse_fuseset_t));
-        cudaError_t errSets2 = cudaMallocManaged(&sets2, filter->segmentLength * (FUSE_SLOTS / 3) * sizeof(fuse_fuseset_t));
+        cudaError_t errSets0 = cudaMallocManaged(&sets0, filter->segmentLength * (FUSE_SLOTS / FUSE_ARITY) * sizeof(fuse_fuseset_t));
+        cudaError_t errSets1 = cudaMallocManaged(&sets1, filter->segmentLength * (FUSE_SLOTS / FUSE_ARITY) * sizeof(fuse_fuseset_t));
+        cudaError_t errSets2 = cudaMallocManaged(&sets2, filter->segmentLength * (FUSE_SLOTS / FUSE_ARITY) * sizeof(fuse_fuseset_t));
 
-        for (size_t seg = 0; seg < (FUSE_SLOTS / 3); seg++) {
+        for (uint32_t seg = 0; seg < (FUSE_SLOTS / FUSE_ARITY); seg++) {
             uint32_t dst0_offset = seg * filter->segmentLength;
             uint32_t src0_offset = seg * FUSE_ARITY * filter->segmentLength;
             memcpy(&sets0[dst0_offset], &sets[src0_offset], filter->segmentLength * sizeof(fuse_fuseset_t));
@@ -538,8 +674,8 @@ bool fuse8_populate(const uint64_t* keys, uint32_t size, fuse8_t* filter) {
             memcpy(&sets2[dst2_offset], &sets[src2_offset], filter->segmentLength * sizeof(fuse_fuseset_t));
         }
 
-        t = clock() - t;
-        time_taken = ((double)t) / CLOCKS_PER_SEC; // in seconds
+        copy_t = clock() - copy_t;
+        time_taken = ((double)copy_t) / CLOCKS_PER_SEC; // in seconds
         printf("It took %f seconds to copy subarrays. \n", time_taken);
 
         bool* pureCell;
@@ -547,30 +683,36 @@ bool fuse8_populate(const uint64_t* keys, uint32_t size, fuse8_t* filter) {
         *pureCell = false;
         *layer = 1;
         size_t old_layer = 0;
+        size_t subrounds = 0;
 
-        // size_t stack_size = 0;
-        clock_t t2 = clock();
-        while (old_layer != *layer) {
+        clock_t peel_t = clock();
+        while (old_layer != *layer) { // Did we peel anything over three subrounds
             old_layer = *layer;
 
+            // countPureCells(filter, sets0, 0);
             peel_set0 << <numBlocks, blockSize >> > (sets, sets0, sets1, sets2, filter, layer, pureCell);
             cudaDeviceSynchronize();
+            subrounds++;
 
             if (*pureCell == true) {
                 *layer = *layer + 1;
                 *pureCell = false;
             }
 
+            // countPureCells(filter, sets1, 1);
             peel_set1 << <numBlocks, blockSize >> > (sets, sets0, sets1, sets2, filter, layer, pureCell);
             cudaDeviceSynchronize();
+            subrounds++;
 
             if (*pureCell == true) {
                 *layer = *layer + 1;
                 *pureCell = false;
             }
 
+            // countPureCells(filter, sets2, 2);
             peel_set2 << <numBlocks, blockSize >> > (sets, sets0, sets1, sets2, filter, layer, pureCell);
             cudaDeviceSynchronize();
+            subrounds++;
 
             if (*pureCell == true) {
                 *layer = *layer + 1;
@@ -578,39 +720,57 @@ bool fuse8_populate(const uint64_t* keys, uint32_t size, fuse8_t* filter) {
             }
 
         }
-        t2 = clock() - t2;
-        time_taken = ((double)t2) / CLOCKS_PER_SEC; // in seconds
-        printf("It took %f seconds to peel over %zu values. \n", time_taken, size);
+        
+        peel_t = clock() - peel_t;
+        time_taken = ((double)peel_t) / CLOCKS_PER_SEC; // in seconds
+        printf("It took %f seconds to peel %u values. \n", time_taken, size);
 
+        clock_t recover_t = clock();
         cudaFree(pureCell);
         cudaFree(sets0);
         cudaFree(sets1);
         cudaFree(sets2);
+        
         size_t recover_cnt = 0;
-        for (int i = 0; i < arrayLength; i++) {
-            if (sets[i].layer > 0) {
-                recover_cnt++;
-            }
-        }
+        recover_cnt = thrust::count_if(thrust::device, sets, sets + arrayLength, is_recovered());
+        cudaDeviceSynchronize();
+
+        recover_t = clock() - recover_t;
+        time_taken = ((double)recover_t) / CLOCKS_PER_SEC; // in seconds
+        printf("It took %f seconds to free memory and check recovery over %zu values. \n", time_taken, arrayLength);
 
         if (recover_cnt == size) {
             // success
             break;
         }
 
+        printf("peel failure, recover_cnt=%zu\n", recover_cnt);
+        fflush(stdout);
         filter->seed = fuse_rng_splitmix64(&rng_counter);
     }
     
-    clock_t t3 = clock();
-    size_t layer_size = *layer;
-    while (layer_size > 0) {
-        assign << <numBlocks, blockSize >> > (filter, sets, layer_size, arrayLength);
-        layer_size--;
+    clock_t sort_t = clock();
+    uint32_t* layer_counts = sortcount_layers(sets, arrayLength, *layer);
+    sort_t = clock() - sort_t;
+    double time_sort = ((double)sort_t) / CLOCKS_PER_SEC; // seconds
+    printf("It took %f to sort and count %zu elements\n", time_sort, arrayLength);
+   
+    clock_t assign_t = clock();
+    size_t layer_size = sets[0].layer;
+    size_t offset = 0;
+
+    for (size_t i = 0; i < layer_size; i++) {
+        assign_compacted << <numBlocks, blockSize >> > (filter, sets + offset, i, layer_counts[i]);
+        cudaDeviceSynchronize();
+        offset += layer_counts[i];
     }
-    cudaDeviceSynchronize();
-    t3 = clock() - t3;
-    double time_taken = ((double)t3) / CLOCKS_PER_SEC; // in seconds
-    printf("It took %f seconds to assign over %zu values. \n", time_taken, size);
+
+    cudaFree(layer_counts);
+    
+    assign_t = clock() - assign_t;
+    double time_taken = ((double) assign_t) / CLOCKS_PER_SEC; // in seconds
+    printf("It took %f seconds to assign over %u values, %zu layers. \n", time_taken, size, *layer);
+    
     cudaFree(layer);
     cudaFree(sets);
 
@@ -646,7 +806,7 @@ bool testfuse8() {
     fuse8_t* filter;
     cudaMallocManaged(&filter, sizeof(fuse8_t));
 
-    size_t size = 10000000;
+    size_t size = 1000000;
     fuse8_allocate(size, filter);
     // we need some set of values
     uint64_t* big_set;
@@ -698,7 +858,7 @@ bool testfuse8(size_t size) {
     }
     // we construct the filter
     fuse8_populate(big_set, size, filter); // warm the cache
-    for (size_t times = 0; times < 1; times++) {
+    for (size_t times = 0; times < 5; times++) {
         clock_t t;
         t = clock();
         fuse8_populate(big_set, size, filter);
@@ -713,10 +873,11 @@ bool testfuse8(size_t size) {
 }
 
 int main() {
-    for (size_t s = 10000000; s <= 10000000; s *= 10) {
-        // testfuse8(s);
-        // testfuse8();
-
+    for (size_t s = 1000000; s <= 1000000; s += 1) {
+        // unit test
+        testfuse8();
+        // performance test
+        testfuse8(s);
         printf("\n");
     }
 }
