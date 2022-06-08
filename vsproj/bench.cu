@@ -512,11 +512,13 @@ bool testxor8() {
     return true;
 }
 
-/* int main() {
-    for (size_t s = 10000000; s <= 10000000; s *= 10) {
-        // testxor8(s);
-        testxor8();
+int main() {
+    // unit test
+    testxor8();
 
+    for (size_t s = 10000000; s <= 100000000; s += 10000000) {
+        // performance test
+        testxor8(s);
         printf("\n");
     }
-} */
+}

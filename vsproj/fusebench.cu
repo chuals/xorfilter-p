@@ -885,9 +885,10 @@ bool testfuse8(size_t size) {
 }
 
 int main() {
-    for (size_t s = 1000000; s <= 1000000; s += 1) {
-        // unit test
-        testfuse8();
+    // unit test
+    testfuse8();
+
+    for (size_t s = 10000000; s <= 100000000; s += 10000000) {
         // performance test
         testfuse8(s);
         printf("\n");
